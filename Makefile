@@ -79,7 +79,7 @@ test: generate lint ## Run tests
 ## --------------------------------------
 
 .PHONY: manager
-manager: generate lint ## Build manager binary
+manager: generate  ## Build manager binary
 	go build -o bin/manager main.go
 
 # Build controller-gen

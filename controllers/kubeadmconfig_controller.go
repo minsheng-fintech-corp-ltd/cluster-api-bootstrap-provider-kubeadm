@@ -22,13 +22,14 @@ import (
 	"strings"
 	"time"
 
+	"sigs.k8s.io/cluster-api-bootstrap-provider-kubeadm/ignition"
+
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	bootstrapv1 "sigs.k8s.io/cluster-api-bootstrap-provider-kubeadm/api/v1alpha2"
-	"sigs.k8s.io/cluster-api-bootstrap-provider-kubeadm/cloudinit"
 	internalcluster "sigs.k8s.io/cluster-api-bootstrap-provider-kubeadm/internal/cluster"
 	kubeadmv1beta1 "sigs.k8s.io/cluster-api-bootstrap-provider-kubeadm/kubeadm/v1beta1"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha2"
@@ -204,6 +205,11 @@ func (r *KubeadmConfigReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, re
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
 
+		// if userdata is already generated for the first machine of control plane,wait until machine is provisioned
+		if config.Status.Ready {
+			return ctrl.Result{},nil
+		}
+
 		defer func() {
 			if rerr != nil {
 				r.KubeadmInitLock.Unlock(ctx, cluster)
@@ -221,7 +227,7 @@ func (r *KubeadmConfigReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, re
 		if config.Spec.InitConfiguration == nil {
 			config.Spec.InitConfiguration = &kubeadmv1beta1.InitConfiguration{
 				TypeMeta: v1.TypeMeta{
-					APIVersion: "kubeadm.k8s.io/v1beta1",
+					APIVersion: "kubeadm.k8s.io/v1beta2",
 					Kind:       "InitConfiguration",
 				},
 			}
@@ -235,7 +241,7 @@ func (r *KubeadmConfigReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, re
 		if config.Spec.ClusterConfiguration == nil {
 			config.Spec.ClusterConfiguration = &kubeadmv1beta1.ClusterConfiguration{
 				TypeMeta: v1.TypeMeta{
-					APIVersion: "kubeadm.k8s.io/v1beta1",
+					APIVersion: "kubeadm.k8s.io/v1beta2",
 					Kind:       "ClusterConfiguration",
 				},
 			}
@@ -256,17 +262,32 @@ func (r *KubeadmConfigReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, re
 			return ctrl.Result{}, err
 		}
 
-		cloudInitData, err := cloudinit.NewInitControlPlane(&cloudinit.ControlPlaneInput{
-			BaseUserData: cloudinit.BaseUserData{
-				AdditionalFiles:     config.Spec.Files,
-				NTP:                 config.Spec.NTP,
-				PreKubeadmCommands:  config.Spec.PreKubeadmCommands,
-				PostKubeadmCommands: config.Spec.PostKubeadmCommands,
-				Users:               config.Spec.Users,
+		//cloudInitData, err := cloudinit.NewInitControlPlane(&cloudinit.ControlPlaneInput{
+		//	BaseUserData: cloudinit.BaseUserData{
+		//		AdditionalFiles:     config.Spec.Files,
+		//		NTP:                 config.Spec.NTP,
+		//		PreKubeadmCommands:  config.Spec.PreKubeadmCommands,
+		//		PostKubeadmCommands: config.Spec.PostKubeadmCommands,
+		//		Users:               config.Spec.Users,
+		//	},
+		//	InitConfiguration:    initdata,
+		//	ClusterConfiguration: clusterdata,
+		//	Certificates:         certificates,
+		//})
+		cloudInitData, err := ignition.GenerateUserData(&ignition.Node{
+			Files: append(certificates.AsFiles(), bootstrapv1.File{
+				Path:        "/etc/kubernetes/kubeadm.yaml",
+				Permissions: "0640",
+				Content:     strings.Join([]string{initdata, clusterdata}, "\n---\n"),
+			}),
+			Services: []ignition.ServiceUnit{
+				{
+					Name:    "kubeinit.service",
+					Content: "[Unit]\nDescription=init kubernetes\nAfter=docker.service\nRequires=docker.service\nConditionPathExists=!/var/lib/kubelet\n[Service]\nType=oneshot\nExecStart=/opt/bin/kubeadm init --config /etc/kubernetes/kubeadm.yaml \n\n[Install]\nWantedBy=multi-user.target\n",
+					Enabled: true,
+					Dropins: getCommandsDropins(config.Spec.PreKubeadmCommands, config.Spec.PostKubeadmCommands),
+				},
 			},
-			InitConfiguration:    initdata,
-			ClusterConfiguration: clusterdata,
-			Certificates:         certificates,
 		})
 		if err != nil {
 			log.Error(err, "failed to generate cloud init for bootstrap control plane")
@@ -322,15 +343,30 @@ func (r *KubeadmConfigReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, re
 		}
 
 		log.Info("Creating BootstrapData for the join control plane")
-		cloudJoinData, err := cloudinit.NewJoinControlPlane(&cloudinit.ControlPlaneJoinInput{
-			JoinConfiguration: joinData,
-			Certificates:      certificates,
-			BaseUserData: cloudinit.BaseUserData{
-				AdditionalFiles:     config.Spec.Files,
-				NTP:                 config.Spec.NTP,
-				PreKubeadmCommands:  config.Spec.PreKubeadmCommands,
-				PostKubeadmCommands: config.Spec.PostKubeadmCommands,
-				Users:               config.Spec.Users,
+		//cloudJoinData, err := cloudinit.NewJoinControlPlane(&cloudinit.ControlPlaneJoinInput{
+		//	JoinConfiguration: joinData,
+		//	Certificates:      certificates,
+		//	BaseUserData: cloudinit.BaseUserData{
+		//		AdditionalFiles:     config.Spec.Files,
+		//		NTP:                 config.Spec.NTP,
+		//		PreKubeadmCommands:  config.Spec.PreKubeadmCommands,
+		//		PostKubeadmCommands: config.Spec.PostKubeadmCommands,
+		//		Users:               config.Spec.Users,
+		//	},
+		//})
+		cloudJoinData, err := ignition.GenerateUserData(&ignition.Node{
+			Files: append(certificates.AsFiles(), bootstrapv1.File{
+				Path:        "/etc/kubernetes/kubeadm.yaml",
+				Permissions: "0640",
+				Content:     joinData,
+			}),
+			Services: []ignition.ServiceUnit{
+				{
+					Name:    "kubeinit.service",
+					Enabled: true,
+					Content: "[Unit]\nDescription=init k8s\nAfter=docker.service\nRequires=docker.service\nConditionPathExists=!/var/lib/kubelet\n[Service]\nType=oneshot\nExecStart=/opt/bin/kubeadm join --config /etc/kubernetes/kubeadm.yaml \n\n[Install]\nWantedBy=multi-user.target\n",
+					Dropins: getCommandsDropins(config.Spec.PreKubeadmCommands, config.Spec.PostKubeadmCommands),
+				},
 			},
 		})
 		if err != nil {
@@ -375,15 +411,30 @@ func (r *KubeadmConfigReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, re
 
 	log.Info("Creating BootstrapData for the worker node")
 
-	cloudJoinData, err := cloudinit.NewNode(&cloudinit.NodeInput{
-		BaseUserData: cloudinit.BaseUserData{
-			AdditionalFiles:     config.Spec.Files,
-			NTP:                 config.Spec.NTP,
-			PreKubeadmCommands:  config.Spec.PreKubeadmCommands,
-			PostKubeadmCommands: config.Spec.PostKubeadmCommands,
-			Users:               config.Spec.Users,
+	//cloudJoinData, err := cloudinit.NewNode(&cloudinit.NodeInput{
+	//	BaseUserData: cloudinit.BaseUserData{
+	//		AdditionalFiles:     config.Spec.Files,
+	//		NTP:                 config.Spec.NTP,
+	//		PreKubeadmCommands:  config.Spec.PreKubeadmCommands,
+	//		PostKubeadmCommands: config.Spec.PostKubeadmCommands,
+	//		Users:               config.Spec.Users,
+	//	},
+	//	JoinConfiguration: joinData,
+	//})
+	cloudJoinData, err := ignition.GenerateUserData(&ignition.Node{
+		Files: append(certificates.AsFiles(), bootstrapv1.File{
+			Path:        "/etc/kubernetes/kubeadm.yaml",
+			Permissions: "0640",
+			Content:     joinData,
+		}),
+		Services: []ignition.ServiceUnit{
+			{
+				Name:    "kubeinit.service",
+				Enabled: true,
+				Content: "[Unit]\nDescription=init k8s\nAfter=docker.service\nRequires=docker.service\nConditionPathExists=!/var/lib/kubelet\n[Service]\nType=oneshot\nExecStart=/opt/bin/kubeadm join --config /etc/kubernetes/kubeadm.yaml \n\n[Install]\nWantedBy=multi-user.target\n",
+				Dropins: getCommandsDropins(config.Spec.PreKubeadmCommands, config.Spec.PostKubeadmCommands),
+			},
 		},
-		JoinConfiguration: joinData,
 	})
 	if err != nil {
 		log.Error(err, "failed to create a worker join configuration")
